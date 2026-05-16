@@ -7,7 +7,7 @@ use sysinfo::{Pid, System};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum TaskType {
     Unzip { path: PathBuf, delete: bool },
-    Mirror { src: PathBuf, dest: PathBuf, remote: Option<String>, port: Option<u16> },
+    Mirror { src: PathBuf, dest: PathBuf, remote: Option<String>, port: Option<u16>, #[serde(default)] use_rsync: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -43,6 +43,18 @@ impl StateManager {
         self.config_dir.join("state.json")
     }
 
+    pub fn log_path(&self, pid: u32) -> PathBuf {
+        self.config_dir.join("logs").join(format!("{}.log", pid))
+    }
+
+    pub fn ensure_log_dir(&self) -> Result<()> {
+        let dir = self.config_dir.join("logs");
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+        }
+        Ok(())
+    }
+
     pub fn load_tasks(&self) -> Result<Vec<DaemonTask>> {
         let path = self.state_path();
         if !path.exists() {
@@ -57,7 +69,7 @@ impl StateManager {
     pub fn get_active_tasks(&self) -> Result<Vec<DaemonTask>> {
         let tasks = self.load_tasks()?;
         let mut system = System::new_all();
-        system.refresh_all();
+        system.refresh_processes();
         
         let active_tasks: Vec<DaemonTask> = tasks
             .into_iter()
@@ -65,6 +77,12 @@ impl StateManager {
             .collect();
             
         Ok(active_tasks)
+    }
+
+    pub fn is_process_running(&self, pid: u32) -> bool {
+        let mut system = System::new();
+        system.refresh_processes();
+        system.process(Pid::from(pid as usize)).is_some()
     }
 
     pub fn save_tasks(&self, tasks: &[DaemonTask]) -> Result<()> {
@@ -75,6 +93,8 @@ impl StateManager {
 
     pub fn add_task(&self, task: DaemonTask) -> Result<()> {
         let mut tasks = self.load_tasks()?;
+        // Remove any existing task with the same PID or same configuration to avoid duplicates
+        tasks.retain(|t| t.pid != task.pid);
         tasks.push(task);
         self.save_tasks(&tasks)?;
         Ok(())

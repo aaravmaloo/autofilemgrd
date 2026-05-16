@@ -51,12 +51,12 @@ impl RemoteClient {
         Ok(())
     }
 
-    pub fn remove_file(&self, remote_path: &str) -> Result<()> {
+    pub fn remove_path(&self, remote_path: &str) -> Result<()> {
         let status = Command::new("ssh")
             .arg("-p")
             .arg(self.port.to_string())
             .arg(&self.user_host)
-            .arg(format!("rm -f \"{}\"", remote_path))
+            .arg(format!("rm -rf \"{}\"", remote_path))
             .status()?;
             
         if !status.success() {
@@ -130,8 +130,16 @@ pub async fn run_remote_mirror_watcher(src: PathBuf, mut remote_dest: String, re
     info!("Mirroring {:?} to remote {}:{}", src, remote, remote_dest);
 
     while let Some(event) = rx.recv().await {
+        if !src.exists() {
+            info!("Source directory {:?} deleted. Stopping mirror.", src);
+            break;
+        }
+
         for path in event.paths {
-            let rel_path = path.strip_prefix(&src).map_err(|e| anyhow!(e))?;
+            let rel_path = match path.strip_prefix(&src) {
+                Ok(p) => p,
+                Err(_) => continue, // Path is not within src (e.g. src itself was deleted and notify sent a path we can't strip)
+            };
             let remote_path = format!("{}/{}", remote_dest, rel_path.to_string_lossy().replace("\\", "/"));
 
             match event.kind {
@@ -153,12 +161,125 @@ pub async fn run_remote_mirror_watcher(src: PathBuf, mut remote_dest: String, re
                     }
                 }
                 EventKind::Remove(_) => {
-                    if let Err(e) = client.remove_file(&remote_path) {
+                    // To avoid spawning thousands of processes for a recursive delete, 
+                    // we could check if the path's parent still exists locally.
+                    // But for now, let's just use rm -rf which is safer.
+                    if let Err(e) = client.remove_path(&remote_path) {
                         error!("Remote rm error: {}", e);
                     }
                 }
                 _ => {}
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_remote_dest(mut remote_dest: String) -> String {
+    if remote_dest.starts_with("~/") {
+        remote_dest = remote_dest.replacen("~/", "./", 1);
+    } else if remote_dest == "~" {
+        remote_dest = ".".to_string();
+    }
+    remote_dest
+}
+
+fn single_quote_for_shell(input: &str) -> String {
+    input.replace('\'', "'\"'\"'")
+}
+
+fn command_error(cmd_label: &str, output: &std::process::Output) -> anyhow::Error {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow!(
+        "{} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        cmd_label,
+        output.status.code(),
+        if stdout.is_empty() { "<empty>" } else { &stdout },
+        if stderr.is_empty() { "<empty>" } else { &stderr },
+    )
+}
+
+#[cfg(windows)]
+fn windows_path_to_wsl(path: &Path) -> Result<String> {
+    let mut raw = path.to_string_lossy().to_string();
+    if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        raw = stripped.to_string();
+    }
+    if let Some(stripped) = raw.strip_prefix("//?/") {
+        raw = stripped.to_string();
+    }
+    let raw = raw.replace('\\', "/");
+    if raw.len() >= 3 && raw.as_bytes()[1] == b':' && raw.as_bytes()[2] == b'/' {
+        let drive = raw.chars().next().unwrap_or('c').to_ascii_lowercase();
+        let rest = &raw[3..];
+        Ok(format!("/mnt/{}/{}", drive, rest))
+    } else {
+        Err(anyhow!("Unsupported Windows path for WSL rsync: {}", raw))
+    }
+}
+
+fn run_remote_rsync_once(src: &Path, remote_dest: &str, remote: &str, port: u16) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let src_unix = windows_path_to_wsl(src)?;
+        let cmd = format!(
+            "rsync -az --delete -e 'ssh -p {}' '{}/' '{}:{}/'",
+            port,
+            single_quote_for_shell(&src_unix),
+            single_quote_for_shell(remote),
+            single_quote_for_shell(remote_dest)
+        );
+        let output = Command::new("wsl")
+            .args(["sh", "-lc", &cmd])
+            .output()?;
+        if !output.status.success() {
+            return Err(command_error("wsl rsync", &output));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let src_unix = src.to_string_lossy().replace('\\', "/");
+        let src_arg = format!("{}/", src_unix);
+        let dest_arg = format!("{}:{}/", remote, remote_dest);
+        let output = Command::new("rsync")
+            .args(["-az", "--delete", "-e", &format!("ssh -p {}", port), &src_arg, &dest_arg])
+            .output()?;
+        if !output.status.success() {
+            return Err(command_error("rsync", &output));
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_remote_rsync_watcher(src: PathBuf, remote_dest: String, remote: String, port: u16) -> Result<()> {
+    let remote_dest = normalize_remote_dest(remote_dest);
+    use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event};
+
+    info!("Performing initial rsync to remote...");
+    if let Err(e) = run_remote_rsync_once(&src, &remote_dest, &remote, port) {
+        error!("Initial remote rsync failed: {}", e);
+        return Err(e);
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let mut watcher = RecommendedWatcher::new(move |res: notify::Result<Event>| {
+        if let Ok(event) = res {
+            let _ = tx.blocking_send(event);
+        }
+    }, Config::default())?;
+
+    watcher.watch(&src, RecursiveMode::Recursive)?;
+    info!("Mirroring {:?} to remote {}:{} using rsync", src, remote, remote_dest);
+
+    while let Some(_event) = rx.recv().await {
+        if !src.exists() {
+            info!("Source directory {:?} deleted. Stopping remote rsync mirror.", src);
+            break;
+        }
+        if let Err(e) = run_remote_rsync_once(&src, &remote_dest, &remote, port) {
+            error!("Remote rsync error: {}", e);
         }
     }
 
