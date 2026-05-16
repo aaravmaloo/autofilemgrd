@@ -1,6 +1,7 @@
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind};
 use std::path::{Path, PathBuf};
 use std::fs;
+use std::process::Command;
 use zip::ZipArchive;
 use anyhow::{Result, anyhow};
 use tracing::{info, error, debug};
@@ -25,6 +26,10 @@ pub async fn run_unzip_watcher(path: PathBuf, delete: bool) -> Result<()> {
     info!("Watching for zip files in {:?}", path);
 
     while let Some(zip_path) = rx.recv().await {
+        if !path.exists() {
+            info!("Watched directory {:?} deleted. Stopping unzip watcher.", path);
+            break;
+        }
         info!("Found zip: {:?}", zip_path);
         if let Err(e) = unzip_and_handle(&zip_path, delete) {
             error!("Error unzipping {:?}: {}", zip_path, e);
@@ -73,7 +78,7 @@ fn unzip_and_handle(zip_path: &Path, delete: bool) -> Result<()> {
 
 pub async fn run_mirror_watcher(src: PathBuf, dest: PathBuf) -> Result<()> {
     // Initial sync
-    sync_dir(&src, &dest)?;
+    sync_dir_with_rsync(&src, &dest)?;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
@@ -87,6 +92,10 @@ pub async fn run_mirror_watcher(src: PathBuf, dest: PathBuf) -> Result<()> {
     info!("Mirroring {:?} to {:?}", src, dest);
 
     while let Some(event) = rx.recv().await {
+        if !src.exists() {
+            info!("Source directory {:?} deleted. Stopping mirror watcher.", src);
+            break;
+        }
         debug!("Mirror event: {:?}", event);
         if let Err(e) = handle_mirror_event(event, &src, &dest) {
             error!("Mirror error: {}", e);
@@ -96,54 +105,25 @@ pub async fn run_mirror_watcher(src: PathBuf, dest: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn sync_dir(src: &Path, dest: &Path) -> Result<()> {
+fn sync_dir_with_rsync(src: &Path, dest: &Path) -> Result<()> {
     if !dest.exists() {
         fs::create_dir_all(dest)?;
     }
-    
-    let mut options = fs_extra::dir::CopyOptions::new();
-    options.overwrite = true;
-    options.copy_inside = true;
-    
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            fs_extra::dir::copy(&path, dest, &options)?;
-        } else {
-            fs::copy(&path, dest.join(path.file_name().unwrap()))?;
-        }
+
+    let src_arg = format!("{}/", src.to_string_lossy().replace('\\', "/"));
+    let dest_arg = format!("{}/", dest.to_string_lossy().replace('\\', "/"));
+    let status = Command::new("rsync")
+        .args(["-a", "--delete", &src_arg, &dest_arg])
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("rsync failed with status {}", status));
     }
     Ok(())
 }
 
 fn handle_mirror_event(event: Event, src_root: &Path, dest_root: &Path) -> Result<()> {
-    for path in event.paths {
-        let rel_path = path.strip_prefix(src_root).map_err(|e| anyhow!(e))?;
-        let target_path = dest_root.join(rel_path);
-
-        match event.kind {
-            EventKind::Create(_) | EventKind::Modify(_) => {
-                if path.is_dir() {
-                    fs::create_dir_all(&target_path)?;
-                } else if path.is_file() {
-                    if let Some(parent) = target_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::copy(&path, &target_path)?;
-                }
-            }
-            EventKind::Remove(_) => {
-                if target_path.exists() {
-                    if target_path.is_dir() {
-                        fs::remove_dir_all(&target_path)?;
-                    } else {
-                        fs::remove_file(&target_path)?;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let _ = event;
+    // For correctness, re-run rsync on each filesystem event.
+    sync_dir_with_rsync(src_root, dest_root)?;
     Ok(())
 }
